@@ -1,6 +1,17 @@
 import os
-from amazon_redshift_bedrock_query import get_redshift_uri
 from sqlalchemy import create_engine
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+def get_redshift_uri():
+    REDSHIFT_HOST = os.getenv('REDSHIFT_HOST')
+    REDSHIFT_PORT = os.getenv('REDSHIFT_PORT', '5439')  # Default port
+    REDSHIFT_DB = os.getenv('REDSHIFT_DB')
+    REDSHIFT_USER = os.getenv('REDSHIFT_USER')
+    REDSHIFT_PASSWORD = os.getenv('REDSHIFT_PASSWORD')
+    return f"redshift+psycopg2://{REDSHIFT_USER}:{REDSHIFT_PASSWORD}@{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DB}"
 
 # Test Redshift connection
 def test_connection():
