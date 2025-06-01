@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Initialize Redshift Data API client
-client = boto3.client('redshift-data')
+client = boto3.client('redshift-data', region_name=os.getenv('BEDROCK_REGION'))
 
 def check_redshift_connection():
     """Verify Redshift connection works"""
