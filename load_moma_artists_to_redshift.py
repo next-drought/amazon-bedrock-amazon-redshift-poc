@@ -26,58 +26,180 @@ def check_redshift_connection(engine):
         print(f"Redshift connection error: {str(e)}")
         return False
 
+def inspect_csv_structure(csv_path):
+    """Inspect CSV file structure and return column mappings"""
+    if not os.path.exists(csv_path):
+        print(f"Error: CSV file not found at {csv_path}")
+        return None
+    
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        headers = reader.fieldnames
+        
+        print(f"CSV headers found: {headers}")
+        
+        # Try to read first row to see sample data
+        try:
+            first_row = next(reader)
+            print(f"Sample row: {first_row}")
+        except StopIteration:
+            print("CSV file appears to be empty")
+            return None
+    
+    # Create column mapping based on common variations
+    # This maps CSV column names to our expected database column names
+    column_mapping = {}
+    
+    for header in headers:
+        header_lower = header.lower().strip()
+        
+        # Map various possible column names to our schema
+        if header_lower in ['artist_id', 'artistid', 'id']:
+            column_mapping['artist_id'] = header
+        elif header_lower in ['full_name', 'name', 'artist_name', 'display_name']:
+            column_mapping['full_name'] = header
+        elif header_lower in ['nationality', 'nation']:
+            column_mapping['nationality'] = header
+        elif header_lower in ['gender', 'sex']:
+            column_mapping['gender'] = header
+        elif header_lower in ['birth_year', 'birthyear', 'birth', 'born']:
+            column_mapping['birth_year'] = header
+        elif header_lower in ['death_year', 'deathyear', 'death', 'died']:
+            column_mapping['death_year'] = header
+    
+    print(f"Column mapping: {column_mapping}")
+    return column_mapping
+
 def create_artists_table(engine):
     """Create artists table in Redshift"""
     with engine.connect() as conn:
         try:
+            # Drop table if exists to avoid conflicts
+            conn.execute(text("DROP TABLE IF EXISTS artists"))
+            
+            # Create table with the same schema as in your examples
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS moma_artists (
-                    artist_id INTEGER PRIMARY KEY,
-                    full_name VARCHAR(255),
-                    nationality VARCHAR(100),
-                    gender VARCHAR(50),
+                CREATE TABLE artists (
+                    artist_id INTEGER NOT NULL,
+                    full_name VARCHAR(200),
+                    nationality VARCHAR(50),
+                    gender VARCHAR(25),
                     birth_year INTEGER,
-                    death_year INTEGER
+                    death_year INTEGER,
+                    CONSTRAINT artists_pk PRIMARY KEY (artist_id)
                 )
             """))
+            conn.commit()
             print("Created artists table")
             return True
         except Exception as e:
             print(f"Error creating table: {str(e)}")
             return False
 
+def safe_int_convert(value):
+    """Safely convert value to int, handling empty strings and None"""
+    if value is None or value == '' or str(value).strip() == '':
+        return None
+    try:
+        return int(float(str(value).strip()))  # Handle cases like "1930.0"
+    except (ValueError, TypeError):
+        return None
+
+def safe_str_convert(value):
+    """Safely convert value to string, handling None"""
+    if value is None:
+        return None
+    return str(value).strip() if str(value).strip() else None
+
 def load_artist_data(engine, csv_path):
     """Load artist data from CSV into Redshift"""
-    if not os.path.exists(csv_path):
-        print(f"Error: CSV file not found at {csv_path}")
+    column_mapping = inspect_csv_structure(csv_path)
+    if not column_mapping:
         return False
-
-    with engine.connect() as conn:
-        with open(csv_path, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    death_year = int(row['death_year']) if row['death_year'] else None
-                    conn.execute(text("""
-                        INSERT INTO moma_artists VALUES (
-                            :artist_id, :full_name, :nationality,
-                            :gender, :birth_year, :death_year
-                        )
-                    """), {
-                        'artist_id': int(row['artist_id']),
-                        'full_name': row['full_name'],
-                        'nationality': row['nationality'],
-                        'gender': row['gender'],
-                        'birth_year': int(row['birth_year']),
-                        'death_year': death_year
-                    })
-                    print(f"Loaded artist {row['artist_id']}: {row['full_name']}")
-                except Exception as e:
-                    print(f"Error loading artist {row['artist_id']}: {str(e)}")
-                    continue
     
-    print("Data loading completed")
-    return True
+    # Check if we have the essential columns
+    if 'artist_id' not in column_mapping:
+        print("Error: No artist_id column found in CSV")
+        return False
+    
+    success_count = 0
+    error_count = 0
+    
+    with engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with open(csv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                
+                for row_num, row in enumerate(reader, 1):
+                    try:
+                        # Extract values using our column mapping
+                        artist_id = safe_int_convert(row.get(column_mapping['artist_id']))
+                        if artist_id is None:
+                            print(f"Row {row_num}: Skipping row with invalid artist_id")
+                            continue
+                        
+                        full_name = safe_str_convert(row.get(column_mapping.get('full_name')))
+                        nationality = safe_str_convert(row.get(column_mapping.get('nationality')))
+                        gender = safe_str_convert(row.get(column_mapping.get('gender')))
+                        birth_year = safe_int_convert(row.get(column_mapping.get('birth_year')))
+                        death_year = safe_int_convert(row.get(column_mapping.get('death_year')))
+                        
+                        # Insert into database
+                        conn.execute(text("""
+                            INSERT INTO artists (artist_id, full_name, nationality, gender, birth_year, death_year)
+                            VALUES (:artist_id, :full_name, :nationality, :gender, :birth_year, :death_year)
+                        """), {
+                            'artist_id': artist_id,
+                            'full_name': full_name,
+                            'nationality': nationality,
+                            'gender': gender,
+                            'birth_year': birth_year,
+                            'death_year': death_year
+                        })
+                        
+                        success_count += 1
+                        if success_count % 100 == 0:
+                            print(f"Loaded {success_count} artists...")
+                            
+                    except Exception as e:
+                        error_count += 1
+                        artist_id_str = row.get(column_mapping.get('artist_id', ''), 'unknown')
+                        print(f"Row {row_num}: Error loading artist {artist_id_str}: {str(e)}")
+                        if error_count > 10:  # Stop if too many errors
+                            print("Too many errors, stopping...")
+                            break
+                        continue
+            
+            trans.commit()
+            print(f"Data loading completed. Success: {success_count}, Errors: {error_count}")
+            return True
+            
+        except Exception as e:
+            trans.rollback()
+            print(f"Transaction failed: {str(e)}")
+            return False
+
+def verify_data_load(engine):
+    """Verify the data was loaded correctly"""
+    with engine.connect() as conn:
+        try:
+            # Count total rows
+            result = conn.execute(text("SELECT COUNT(*) FROM artists"))
+            count = result.fetchone()[0]
+            print(f"Total artists loaded: {count}")
+            
+            # Show a few sample rows
+            result = conn.execute(text("SELECT * FROM artists LIMIT 5"))
+            rows = result.fetchall()
+            print("\nSample data:")
+            for row in rows:
+                print(f"  {dict(row._mapping)}")
+                
+            return True
+        except Exception as e:
+            print(f"Error verifying data: {str(e)}")
+            return False
 
 if __name__ == '__main__':
     engine = get_redshift_connection()
@@ -91,3 +213,8 @@ if __name__ == '__main__':
         csv_path = 'SampleData/moma_public_artists.csv'
         if load_artist_data(engine, csv_path):
             print("Successfully loaded MoMA artist data into Redshift")
+            verify_data_load(engine)
+        else:
+            print("Failed to load artist data")
+    else:
+        print("Failed to create artists table")
