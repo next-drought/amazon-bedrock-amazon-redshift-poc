@@ -33,6 +33,10 @@ MANIFEST
 *.spec
 pip-log.txt
 pip-delete-this-directory.txt
+local_deployment_info.txt
+python_aws_deployment_guide.md
+beginner_deployment_guide.md
+colleague_iam_setup.sh
 htmlcov/
 .tox/
 .nox/
