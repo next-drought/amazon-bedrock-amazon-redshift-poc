@@ -36,7 +36,7 @@ def inspect_csv_structure(csv_path):
         print(f"Error: CSV file not found at {csv_path}")
         return None
     
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig automatically handles BOM
         reader = csv.DictReader(f)
         headers = reader.fieldnames
         
@@ -54,20 +54,21 @@ def inspect_csv_structure(csv_path):
     column_mapping = {}
     
     for header in headers:
-        header_lower = header.lower().strip()
+        # Remove BOM and clean header
+        header_clean = header.replace('\ufeff', '').lower().strip()
         
         # Map various possible column names to our schema
-        if header_lower in ['artist_id', 'artistid', 'id', 'constituentid']:
+        if header_clean in ['artist_id', 'artistid', 'id', 'constituentid']:
             column_mapping['artist_id'] = header
-        elif header_lower in ['full_name', 'name', 'artist_name', 'display_name', 'displayname']:
+        elif header_clean in ['full_name', 'name', 'artist_name', 'display_name', 'displayname']:
             column_mapping['full_name'] = header
-        elif header_lower in ['nationality', 'nation']:
+        elif header_clean in ['nationality', 'nation']:
             column_mapping['nationality'] = header
-        elif header_lower in ['gender', 'sex']:
+        elif header_clean in ['gender', 'sex']:
             column_mapping['gender'] = header
-        elif header_lower in ['birth_year', 'birthyear', 'birth', 'born', 'beginyear']:
+        elif header_clean in ['birth_year', 'birthyear', 'birth', 'born', 'beginyear']:
             column_mapping['birth_year'] = header
-        elif header_lower in ['death_year', 'deathyear', 'death', 'died', 'endyear']:
+        elif header_clean in ['death_year', 'deathyear', 'death', 'died', 'endyear']:
             column_mapping['death_year'] = header
     
     print(f"Column mapping: {column_mapping}")
@@ -130,7 +131,7 @@ def load_artist_data(engine, csv_path):
     
     try:
         with engine.connect() as conn:
-            with open(csv_path, 'r', encoding='utf-8') as f:
+            with open(csv_path, 'r', encoding='utf-8-sig') as f:  # utf-8-sig handles BOM
                 reader = csv.DictReader(f)
                 
                 for row_num, row in enumerate(reader, 1):
