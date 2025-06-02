@@ -16,14 +16,18 @@ from langchain_experimental.sql import SQLDatabaseChain
 # Loading environment variables
 load_dotenv()
 
-# configuring your instance of Amazon bedrock, selecting the CLI profile, modelID, endpoint url and region.
-llm = Bedrock(
-    credentials_profile_name=os.getenv("profile_name", "default"),
-    model_id="amazon.titan-text-express-v1",
-    endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com",
-    region_name="us-east-1",
-    verbose=True
-)
+# Simple Bedrock initialization for EC2 with IAM role
+try:
+    llm = Bedrock(
+        model_id="amazon.titan-text-express-v1",
+        region_name="us-east-1",
+        verbose=True
+    )
+    print("✓ Bedrock initialized successfully using IAM role")
+except Exception as e:
+    print(f"✗ Error initializing Bedrock: {e}")
+    print("Please ensure your EC2 instance has an IAM role with Bedrock permissions")
+    raise
 
 
 def redshift_answer(question):
