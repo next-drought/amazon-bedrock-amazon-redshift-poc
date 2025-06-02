@@ -6,15 +6,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_redshift_connection():
-    """Create and return a Redshift connection"""
+    """Create and return a Redshift connection with autocommit"""
     REDSHIFT_HOST = os.getenv('REDSHIFT_HOST')
     REDSHIFT_PORT = os.getenv('REDSHIFT_PORT', '5439')
     REDSHIFT_DB = os.getenv('REDSHIFT_DB')
     REDSHIFT_USER = os.getenv('REDSHIFT_USER')
     REDSHIFT_PASSWORD = os.getenv('REDSHIFT_PASSWORD')
-    return create_engine(
-        f"redshift+psycopg2://{REDSHIFT_USER}:{REDSHIFT_PASSWORD}@{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DB}"
+    
+    # Create engine with autocommit isolation level
+    engine = create_engine(
+        f"redshift+psycopg2://{REDSHIFT_USER}:{REDSHIFT_PASSWORD}@{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DB}",
+        isolation_level="AUTOCOMMIT"
     )
+    return engine
 
 def check_redshift_connection(engine):
     """Verify Redshift connection works"""
@@ -41,43 +45,57 @@ def inspect_csv_structure(csv_path):
         # Try to read first row to see sample data
         try:
             first_row = next(reader)
-            print(f"Sample row: {first_row}")
+            print(f"Sample row: {dict(list(first_row.items())[:5])}...")  # Show first 5 fields
         except StopIteration:
             print("CSV file appears to be empty")
             return None
     
     # Create column mapping based on common variations
-    # This maps CSV column names to our expected database column names
     column_mapping = {}
     
     for header in headers:
         header_lower = header.lower().strip()
         
         # Map various possible column names to our schema
-        if header_lower in ['artist_id', 'artistid', 'id']:
+        if header_lower in ['artist_id', 'artistid', 'id', 'constituentid']:
             column_mapping['artist_id'] = header
-        elif header_lower in ['full_name', 'name', 'artist_name', 'display_name']:
+        elif header_lower in ['full_name', 'name', 'artist_name', 'display_name', 'displayname']:
             column_mapping['full_name'] = header
         elif header_lower in ['nationality', 'nation']:
             column_mapping['nationality'] = header
         elif header_lower in ['gender', 'sex']:
             column_mapping['gender'] = header
-        elif header_lower in ['birth_year', 'birthyear', 'birth', 'born']:
+        elif header_lower in ['birth_year', 'birthyear', 'birth', 'born', 'beginyear']:
             column_mapping['birth_year'] = header
-        elif header_lower in ['death_year', 'deathyear', 'death', 'died']:
+        elif header_lower in ['death_year', 'deathyear', 'death', 'died', 'endyear']:
             column_mapping['death_year'] = header
     
     print(f"Column mapping: {column_mapping}")
     return column_mapping
 
+def safe_int_convert(value):
+    """Safely convert value to int, handling empty strings and None"""
+    if value is None or value == '' or str(value).strip() == '':
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return None
+
+def safe_str_convert(value):
+    """Safely convert value to string, handling None"""
+    if value is None or value == '':
+        return None
+    return str(value).strip() if str(value).strip() else None
+
 def create_artists_table(engine):
     """Create artists table in Redshift"""
-    with engine.connect() as conn:
-        try:
-            # Drop table if exists to avoid conflicts
+    try:
+        with engine.connect() as conn:
+            # Drop table if exists
             conn.execute(text("DROP TABLE IF EXISTS artists"))
             
-            # Create table with the same schema as in your examples
+            # Create table
             conn.execute(text("""
                 CREATE TABLE artists (
                     artist_id INTEGER NOT NULL,
@@ -89,27 +107,11 @@ def create_artists_table(engine):
                     CONSTRAINT artists_pk PRIMARY KEY (artist_id)
                 )
             """))
-            conn.commit()
-            print("Created artists table")
-            return True
-        except Exception as e:
-            print(f"Error creating table: {str(e)}")
-            return False
-
-def safe_int_convert(value):
-    """Safely convert value to int, handling empty strings and None"""
-    if value is None or value == '' or str(value).strip() == '':
-        return None
-    try:
-        return int(float(str(value).strip()))  # Handle cases like "1930.0"
-    except (ValueError, TypeError):
-        return None
-
-def safe_str_convert(value):
-    """Safely convert value to string, handling None"""
-    if value is None:
-        return None
-    return str(value).strip() if str(value).strip() else None
+        print("Created artists table")
+        return True
+    except Exception as e:
+        print(f"Error creating table: {str(e)}")
+        return False
 
 def load_artist_data(engine, csv_path):
     """Load artist data from CSV into Redshift"""
@@ -120,14 +122,14 @@ def load_artist_data(engine, csv_path):
     # Check if we have the essential columns
     if 'artist_id' not in column_mapping:
         print("Error: No artist_id column found in CSV")
+        print("Available mappings:", column_mapping)
         return False
     
     success_count = 0
     error_count = 0
     
-    with engine.connect() as conn:
-        trans = conn.begin()
-        try:
+    try:
+        with engine.connect() as conn:
             with open(csv_path, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 
@@ -136,7 +138,8 @@ def load_artist_data(engine, csv_path):
                         # Extract values using our column mapping
                         artist_id = safe_int_convert(row.get(column_mapping['artist_id']))
                         if artist_id is None:
-                            print(f"Row {row_num}: Skipping row with invalid artist_id")
+                            if row_num <= 5:  # Only show first few invalid IDs
+                                print(f"Row {row_num}: Skipping row with invalid artist_id: '{row.get(column_mapping['artist_id'])}'")
                             continue
                         
                         full_name = safe_str_convert(row.get(column_mapping.get('full_name')))
@@ -159,26 +162,25 @@ def load_artist_data(engine, csv_path):
                         })
                         
                         success_count += 1
-                        if success_count % 100 == 0:
+                        if success_count % 500 == 0:
                             print(f"Loaded {success_count} artists...")
                             
                     except Exception as e:
                         error_count += 1
-                        artist_id_str = row.get(column_mapping.get('artist_id', ''), 'unknown')
-                        print(f"Row {row_num}: Error loading artist {artist_id_str}: {str(e)}")
-                        if error_count > 10:  # Stop if too many errors
+                        if error_count <= 5:  # Only show first few errors
+                            artist_id_str = row.get(column_mapping.get('artist_id', ''), 'unknown')
+                            print(f"Row {row_num}: Error loading artist {artist_id_str}: {str(e)}")
+                        if error_count > 100:  # Stop if too many errors
                             print("Too many errors, stopping...")
                             break
                         continue
-            
-            trans.commit()
-            print(f"Data loading completed. Success: {success_count}, Errors: {error_count}")
-            return True
-            
-        except Exception as e:
-            trans.rollback()
-            print(f"Transaction failed: {str(e)}")
-            return False
+        
+        print(f"Data loading completed. Success: {success_count}, Errors: {error_count}")
+        return success_count > 0
+        
+    except Exception as e:
+        print(f"Loading failed: {str(e)}")
+        return False
 
 def verify_data_load(engine):
     """Verify the data was loaded correctly"""
@@ -194,7 +196,7 @@ def verify_data_load(engine):
             rows = result.fetchall()
             print("\nSample data:")
             for row in rows:
-                print(f"  {dict(row._mapping)}")
+                print(f"  ID: {row[0]}, Name: {row[1]}, Nationality: {row[2]}, Gender: {row[3]}, Born: {row[4]}, Died: {row[5]}")
                 
             return True
         except Exception as e:
@@ -202,7 +204,9 @@ def verify_data_load(engine):
             return False
 
 if __name__ == '__main__':
+    print("Connecting to Redshift...")
     engine = get_redshift_connection()
+    
     if not check_redshift_connection(engine):
         print("Failed to connect to Redshift")
         exit(1)
