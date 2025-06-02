@@ -10,12 +10,21 @@ load_dotenv()
 client = boto3.client('redshift-data', region_name=os.getenv('BEDROCK_REGION'))
 
 def check_redshift_connection():
-    """Verify Redshift connection works"""
+    """Verify Redshift connection works by executing a simple query"""
     try:
-        response = client.describe_statement(Id='dummy')
+        response = client.execute_statement(
+            Database=os.getenv('REDSHIFT_DB'),
+            ClusterIdentifier=os.getenv('REDSHIFT_HOST'),
+            DbUser=os.getenv('REDSHIFT_USER'),
+            Sql="SELECT 1"
+        )
         return True
     except Exception as e:
         print(f"Redshift connection error: {str(e)}")
+        print("Please verify:")
+        print(f"- REDSHIFT_HOST, REDSHIFT_DB, REDSHIFT_USER are set correctly in .env")
+        print(f"- IAM role has AmazonRedshiftDataFullAccess permission")
+        print(f"- Redshift cluster is running and accessible")
         return False
 
 def create_artists_table():
