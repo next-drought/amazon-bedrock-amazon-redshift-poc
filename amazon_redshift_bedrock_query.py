@@ -1,241 +1,239 @@
 import os
+import json
+import boto3
+from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
-import yaml
-from langchain.prompts.few_shot import FewShotPromptTemplate
-from langchain.prompts.prompt import PromptTemplate
-from langchain.sql_database import SQLDatabase
-from langchain.chains.sql_database.prompt import PROMPT_SUFFIX, _postgres_prompt
-from langchain.embeddings.huggingface import HuggingFaceEmbeddings
-from langchain.llms import Bedrock
-from langchain.prompts.example_selector.semantic_similarity import (
-    SemanticSimilarityExampleSelector,
-)
-from langchain_community.vectorstores import Chroma
-from langchain_experimental.sql import SQLDatabaseChain
+from botocore.exceptions import ClientError
 
 # Loading environment variables
 load_dotenv()
 
-# Simple Bedrock initialization for EC2 with IAM role
-try:
-    llm = Bedrock(
-        model_id="amazon.titan-text-express-v1",
-        region_name="us-east-1",
-        verbose=True
-    )
-    print("✓ Bedrock initialized successfully using IAM role")
-except Exception as e:
-    print(f"✗ Error initializing Bedrock: {e}")
-    print("Please ensure your EC2 instance has an IAM role with Bedrock permissions")
-    raise
-
-
-def redshift_answer(question):
-    """
-    This function collects all necessary information to execute the sql_db_chain and get an answer generated, taking
-    a natural language question in and returning an answer and generated SQL query.
-    :param question: The question the user passes in from the frontend
-    :return: The final answer in natural language along with the generated SQL query.
-    """
+def call_bedrock_directly(prompt, model_id="amazon.titan-text-express-v1"):
+    """Call AWS Bedrock directly without LangChain"""
     try:
-        # retrieving the final Redshift URI to initiate a connection with the database
-        redshift_uri = get_redshift_uri()
-        print(f"Connecting to Redshift with URI: {redshift_uri.replace(os.getenv('REDSHIFT_PASSWORD', ''), '***')}")
+        bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-east-1')
         
-        # formatting the Redshift URI and preparing it to be used with Langchain sql_db_chain
-        db = SQLDatabase.from_uri(redshift_uri)
+        body = {
+            "inputText": prompt,
+            "textGenerationConfig": {
+                "maxTokenCount": 500,
+                "temperature": 0.1,
+                "topP": 0.9
+            }
+        }
         
-        # loading the sample prompts from SampleData/moma_examples.yaml
-        examples = load_samples()
+        response = bedrock_runtime.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json"
+        )
         
-        # initiating the sql_db_chain with the specific LLM we are using, the db connection string and the selected examples
-        sql_db_chain = load_few_shot_chain(llm, db, examples)
-        
-        # the answer created by Amazon Bedrock and ultimately passed back to the end user
-        answer = sql_db_chain(question)
-        
-        # Passing back both the generated SQL query and the final result in a natural language format
-        return answer["intermediate_steps"][1], answer["result"]
+        response_body = json.loads(response['body'].read())
+        return response_body['results'][0]['outputText'].strip()
         
     except Exception as e:
-        print(f"Error in redshift_answer: {str(e)}")
-        return f"-- Error: {str(e)}", f"Sorry, I encountered an error: {str(e)}"
+        print(f"Bedrock error: {e}")
+        return None
 
+def get_redshift_connection():
+    """Create Redshift connection"""
+    REDSHIFT_HOST = os.getenv('REDSHIFT_HOST')
+    REDSHIFT_PORT = os.getenv('REDSHIFT_PORT') or '5439'
+    REDSHIFT_DATABASE = os.getenv('REDSHIFT_DB')
+    REDSHIFT_USERNAME = os.getenv('REDSHIFT_USER')
+    REDSHIFT_PASSWORD = os.getenv('REDSHIFT_PASSWORD')
 
-def get_redshift_uri():
-    """
-    This function is used to build the Redshift URL and eventually used to connect to the database.
-    :return: The full Redshift URL that is used to query against.
-    """
-    # setting the key parameters to build the Redshift connection string, these are stored in the .env file
-    # Updated to match common environment variable naming patterns
-    REDSHIFT_HOST = os.getenv('REDSHIFT_HOST') or os.getenv('redshift_host')
-    REDSHIFT_PORT = os.getenv('REDSHIFT_PORT') or os.getenv('redshift_port') or '5439'
-    REDSHIFT_DATABASE = os.getenv('REDSHIFT_DB') or os.getenv('redshift_database')
-    REDSHIFT_USERNAME = os.getenv('REDSHIFT_USER') or os.getenv('redshift_username')
-    REDSHIFT_PASSWORD = os.getenv('REDSHIFT_PASSWORD') or os.getenv('redshift_password')
-
-    # Clean up the port - ensure it's not None or empty string
     if not REDSHIFT_PORT or REDSHIFT_PORT.lower() == 'none':
         REDSHIFT_PORT = '5439'
-    
-    # Validate that all required parameters are present
+
     if not all([REDSHIFT_HOST, REDSHIFT_DATABASE, REDSHIFT_USERNAME, REDSHIFT_PASSWORD]):
-        missing = [var for var, val in {
-            'REDSHIFT_HOST': REDSHIFT_HOST,
-            'REDSHIFT_DATABASE': REDSHIFT_DATABASE, 
-            'REDSHIFT_USERNAME': REDSHIFT_USERNAME,
-            'REDSHIFT_PASSWORD': REDSHIFT_PASSWORD
-        }.items() if not val]
-        raise ValueError(f"Missing required environment variables: {missing}")
+        raise ValueError("Missing required Redshift environment variables")
 
-    print(f"Debug - Connection params: Host={REDSHIFT_HOST}, Port={REDSHIFT_PORT}, DB={REDSHIFT_DATABASE}, User={REDSHIFT_USERNAME}")
+    connection_string = f"redshift+psycopg2://{REDSHIFT_USERNAME}:{REDSHIFT_PASSWORD}@{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DATABASE}"
+    return create_engine(connection_string, isolation_level="AUTOCOMMIT")
 
-    # taking all the inputted parameters and formatting them in a finalized string
-    REDSHIFT_ENDPOINT = f"redshift+psycopg2://{REDSHIFT_USERNAME}:{REDSHIFT_PASSWORD}@{REDSHIFT_HOST}:{REDSHIFT_PORT}/{REDSHIFT_DATABASE}"
+def get_table_schema():
+    """Return database schema for prompt"""
+    return """
+Database Schema:
+CREATE TABLE artists (
+    artist_id INTEGER NOT NULL,
+    full_name VARCHAR(200),
+    nationality VARCHAR(50), 
+    gender VARCHAR(25),
+    birth_year INTEGER,
+    death_year INTEGER,
+    CONSTRAINT artists_pk PRIMARY KEY (artist_id)
+)
+
+Sample data:
+artist_id | full_name      | nationality | gender | birth_year | death_year
+1         | Robert Arneson | American    | Male   | 1930       | 1992
+2         | Doroteo Arnaiz | Spanish     | Male   | 1936       | NULL
+3         | Bill Arnold    | American    | Male   | 1941       | NULL
+
+Examples:
+- "How many artists are there?" → SELECT COUNT(*) FROM artists;
+- "How many French artists?" → SELECT COUNT(*) FROM artists WHERE nationality = 'French';
+- "Show top nationalities" → SELECT nationality, COUNT(*) FROM artists GROUP BY nationality ORDER BY COUNT(*) DESC LIMIT 10;
+"""
+
+def extract_sql_from_response(response):
+    """Extract SQL from LLM response"""
+    if not response:
+        return None
     
-    # returning the final Redshift URL that was built in the line of code above
-    return REDSHIFT_ENDPOINT
+    # Look for SQL in code blocks
+    if "```sql" in response:
+        start = response.find("```sql") + 6
+        end = response.find("```", start)
+        return response[start:end].strip()
+    elif "```" in response:
+        start = response.find("```") + 3
+        end = response.find("```", start)
+        return response[start:end].strip()
+    
+    # Look for SELECT statements
+    lines = response.split('\n')
+    sql_lines = []
+    for line in lines:
+        if any(keyword in line.upper() for keyword in ['SELECT', 'FROM', 'WHERE']):
+            sql_lines.append(line.strip())
+    
+    return '\n'.join(sql_lines) if sql_lines else response.strip()
 
+def simple_nl_to_sql(question):
+    """Simple pattern matching for common queries"""
+    question_lower = question.lower()
+    
+    if "how many" in question_lower and "artist" in question_lower:
+        if "french" in question_lower:
+            return "SELECT COUNT(*) FROM artists WHERE nationality = 'French';"
+        elif "american" in question_lower:
+            return "SELECT COUNT(*) FROM artists WHERE nationality = 'American';"
+        else:
+            return "SELECT COUNT(*) FROM artists;"
+    
+    elif "nationality" in question_lower and ("count" in question_lower or "group" in question_lower):
+        return """SELECT nationality, COUNT(*) as count 
+                  FROM artists 
+                  WHERE nationality IS NOT NULL 
+                  GROUP BY nationality 
+                  ORDER BY count DESC 
+                  LIMIT 10;"""
+    
+    elif "gender" in question_lower and ("count" in question_lower or "group" in question_lower):
+        return """SELECT gender, COUNT(*) as count 
+                  FROM artists 
+                  WHERE gender IS NOT NULL 
+                  GROUP BY gender 
+                  ORDER BY count DESC;"""
+    
+    elif any(word in question_lower for word in ["show", "list", "display"]):
+        return "SELECT artist_id, full_name, nationality, gender, birth_year, death_year FROM artists LIMIT 10;"
+    
+    else:
+        return "SELECT COUNT(*) FROM artists;"
 
-def load_samples():
-    """
-    Load the sql examples for few-shot prompting examples
-    :return: The sql samples from the moma_examples.yaml file
-    """
+def natural_language_to_sql(question):
+    """Convert natural language to SQL using Bedrock LLM only"""
+    schema = get_table_schema()
+    prompt = f"""Convert this natural language question to SQL using the schema below.
+Return ONLY the SQL query, no explanations.
+
+{schema}
+
+Question: {question}
+
+SQL:"""
+    
+    response = call_bedrock_directly(prompt)
+    if not response:
+        raise Exception("Bedrock LLM failed to respond")
+    
+    sql = extract_sql_from_response(response)
+    if not sql or 'SELECT' not in sql.upper():
+        raise Exception("Invalid SQL generated by LLM")
+    
+    return sql
+
+def execute_sql_query(sql_query):
+    """Execute SQL and format results"""
     try:
-        # Fixed the file path case sensitivity
-        yaml_path = "SampleData/moma_examples.yaml"
-        if not os.path.exists(yaml_path):
-            print(f"Warning: {yaml_path} not found, trying alternative paths...")
-            # Try some alternative paths
-            alternative_paths = [
-                "Sampledata/moma_examples.yaml",
-                "sampledata/moma_examples.yaml", 
-                "moma_examples.yaml"
-            ]
-            for alt_path in alternative_paths:
-                if os.path.exists(alt_path):
-                    yaml_path = alt_path
-                    print(f"Found YAML file at: {yaml_path}")
-                    break
-            else:
-                raise FileNotFoundError(f"Could not find moma_examples.yaml in any expected location")
+        engine = get_redshift_connection()
+        with engine.connect() as conn:
+            result = conn.execute(text(sql_query))
+            rows = result.fetchall()
+            
+            if not rows:
+                return "No results found."
+            
+            # Single value result
+            if len(rows) == 1 and len(rows[0]) == 1:
+                return f"{rows[0][0]:,}"
+            
+            # Multiple rows - format as table
+            formatted_result = []
+            
+            # Add rows (limit to 20)
+            for i, row in enumerate(rows[:20]):
+                row_str = " | ".join(f"{str(val):15}" for val in row)
+                formatted_result.append(row_str)
+            
+            if len(rows) > 20:
+                formatted_result.append(f"... and {len(rows) - 20} more rows")
+            
+            return "\n".join(formatted_result)
+            
+    except Exception as e:
+        return f"Error executing query: {str(e)}"
+
+def redshift_answer(question):
+    """Main function - returns (sql, answer) tuple"""
+    try:
+        print(f"Processing: {question}")
         
-        # opening our prompt sample file
-        with open(yaml_path, "r") as stream:
-            # reading our prompt samples into the sql_samples variable
-            sql_samples = yaml.safe_load(stream)
+        # Convert to SQL
+        sql_query = natural_language_to_sql(question)
         
-        print(f"Loaded {len(sql_samples)} examples from {yaml_path}")
-        return sql_samples
+        if not sql_query:
+            return ("-- Unable to generate SQL", "Sorry, I couldn't understand your question.")
+        
+        print(f"Generated SQL: {sql_query}")
+        
+        # Execute SQL
+        answer = execute_sql_query(sql_query)
+        
+        return (sql_query, answer)
         
     except Exception as e:
-        print(f"Error loading samples: {str(e)}")
-        # Return a basic example if file loading fails
-        return [{
-            "input": "How many artists are there?",
-            "sql_cmd": "SELECT COUNT(*) FROM artists;",
-            "sql_result": "[(15086,)]",
-            "answer": "There are 15086 artists in the database.",
-            "table_info": """CREATE TABLE artists (
-                artist_id INTEGER NOT NULL,
-                full_name VARCHAR(200),
-                nationality VARCHAR(50),
-                gender VARCHAR(25),
-                birth_year INTEGER,
-                death_year INTEGER,
-                CONSTRAINT artists_pk PRIMARY KEY (artist_id)
-            )"""
-        }]
+        error_msg = f"Sorry, I encountered an error: {str(e)}"
+        return ("-- Error occurred", error_msg)
 
-
-def load_few_shot_chain(llm, db, examples):
-    """
-    This function is used to load in the most similar prompts, format them along with the users question and then is
-    passed in to Amazon Bedrock to generate an answer.
-    :param llm: Large Language model you are using
-    :param db: The Redshift database URL
-    :param examples: The samples loaded from your examples file.
-    :return: The results from the SQLDatabaseChain
-    """
+def test_connection():
+    """Test the setup"""
     try:
-        # This is formatting the prompts that are retrieved from the SampleData/moma_examples.yaml
-        example_prompt = PromptTemplate(
-            input_variables=["table_info", "input", "sql_cmd", "sql_result", "answer"],
-            template=(
-                "{table_info}\n\nQuestion: {input}\nSQLQuery: {sql_cmd}\nSQLResult:"
-                " {sql_result}\nAnswer: {answer}"
-            ),
-        )
+        # Test Bedrock
+        response = call_bedrock_directly("Hello, can you help me?")
+        print(f"✓ Bedrock test: {response[:50] if response else 'Failed'}")
         
-        # instantiating the hugging face embeddings model to be used to produce embeddings of user queries and prompts
-        local_embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        # Test Redshift
+        engine = get_redshift_connection()
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT COUNT(*) FROM artists"))
+            count = result.fetchone()[0]
+            print(f"✓ Redshift test: {count} artists found")
         
-        # The example selector loads the examples, creates the embeddings, stores them in Chroma (vector store) and a
-        # semantic search is performed to see the similarity between the question and prompts, it returns the 3 most similar
-        # prompts as defined by k
-        example_selector = SemanticSimilarityExampleSelector.from_examples(
-            examples,
-            local_embeddings,
-            Chroma,
-            k=min(3, len(examples)),
-        )
-        
-        # This is orchestrating the example selector (finding similar prompts to the question), example_prompt (formatting
-        # the retrieved prompts, and formatting the chat history and the user input
-        few_shot_prompt = FewShotPromptTemplate(
-            example_selector=example_selector,
-            example_prompt=example_prompt,
-            prefix=_postgres_prompt + "Provide no preamble",
-            suffix=PROMPT_SUFFIX,
-            input_variables=["table_info", "input", "top_k"],
-        )
-        
-        # Where the LLM, DB and prompts are all orchestrated to answer a user query.
-        return SQLDatabaseChain.from_llm(
-            llm,
-            db,
-            prompt=few_shot_prompt,
-            use_query_checker=True,
-            verbose=True,
-            return_intermediate_steps=True,
-        )
-    except Exception as e:
-        print(f"Error creating few-shot chain: {str(e)}")
-        raise
-
-
-def test_redshift_connection():
-    """Test the Redshift connection and basic functionality"""
-    try:
-        redshift_uri = get_redshift_uri()
-        db = SQLDatabase.from_uri(redshift_uri)
-        
-        # Test basic connection
-        result = db.run("SELECT 1")
-        print(f"✓ Database connection successful")
-        
-        # Test artists table
-        result = db.run("SELECT COUNT(*) FROM artists")
-        print(f"✓ Artists table accessible, count: {result}")
+        # Test full flow
+        sql, answer = redshift_answer("How many artists are there?")
+        print(f"✓ Full test - SQL: {sql}")
+        print(f"✓ Full test - Answer: {answer}")
         
         return True
     except Exception as e:
-        print(f"✗ Connection test failed: {str(e)}")
+        print(f"✗ Test failed: {e}")
         return False
 
-
 if __name__ == "__main__":
-    print("Testing Redshift connection and LangChain setup...")
-    
-    if test_redshift_connection():
-        print("\nTesting sample question...")
-        try:
-            sql, answer = redshift_answer("How many artists are there?")
-            print(f"SQL: {sql}")
-            print(f"Answer: {answer}")
-        except Exception as e:
-            print(f"Error testing sample question: {str(e)}")
-    else:
-        print("Cannot proceed with tests due to connection issues.")
+    test_connection()
